@@ -63,3 +63,44 @@ final class BroomTests: XCTestCase {
         XCTAssertEqual(Format.percent(0.256), "26%")
     }
 }
+
+final class SunburstMorphTests: XCTestCase {
+    func testZoomInMapsChosenFolderOntoFullCircle() {
+        let root = FileNode(name: "/r", isDirectory: true)
+        let a = FileNode(name: "a", isDirectory: true, parent: root)
+        let b = FileNode(name: "b", isDirectory: true, parent: root)
+        let a1 = FileNode(name: "a1", isDirectory: false, size: 300, parent: a)
+        let a2 = FileNode(name: "a2", isDirectory: false, size: 100, parent: a)
+        let b1 = FileNode(name: "b1", isDirectory: false, size: 600, parent: b)
+        a.attach(children: [a1, a2]); b.attach(children: [b1]); root.attach(children: [a, b])
+        let outer = SunburstLayout.arcs(for: root)
+        let inner = SunburstLayout.arcs(for: a)
+        let tx = MorphTransform.between(from: outer, fromRoot: root, to: inner, toRoot: a)
+        XCTAssertNotNil(tx)
+        guard let tx else { return }
+        XCTAssertTrue(tx.zoomIn)
+        let arcA = outer.first { $0.node === a }!
+        let (d, s, e) = tx.target(depth: Double(arcA.depth), start: arcA.start, end: arcA.end)
+        XCTAssertEqual(d, 0, accuracy: 1e-9)
+        XCTAssertEqual(s, 0, accuracy: 1e-9)
+        XCTAssertEqual(e, 2 * .pi, accuracy: 1e-9)
+        // a1 sits at depth 2 in the outer map and depth 1 in the inner map; source() must recover the outer place.
+        let innerA1 = inner.first { $0.node === a1 }!
+        let outerA1 = outer.first { $0.node === a1 }!
+        let (d0, s0, e0) = tx.source(depth: Double(innerA1.depth), start: innerA1.start, end: innerA1.end)
+        XCTAssertEqual(d0, Double(outerA1.depth), accuracy: 1e-9)
+        XCTAssertEqual(s0, outerA1.start, accuracy: 1e-9)
+        XCTAssertEqual(e0, outerA1.end, accuracy: 1e-9)
+        // b lives outside the zoomed folder, so it leaves the circle.
+        let arcB = outer.first { $0.node === b }!
+        let (_, sb, eb) = tx.target(depth: Double(arcB.depth), start: arcB.start, end: arcB.end)
+        XCTAssertTrue(eb <= 1e-9 || sb >= 2 * .pi - 1e-9, "b should be pushed outside the circle")
+        // Zooming back out is the inverse.
+        let back = MorphTransform.between(from: inner, fromRoot: a, to: outer, toRoot: root)!
+        XCTAssertFalse(back.zoomIn)
+        let (d2, s2, e2) = back.target(depth: Double(innerA1.depth), start: innerA1.start, end: innerA1.end)
+        XCTAssertEqual(d2, Double(outerA1.depth), accuracy: 1e-9)
+        XCTAssertEqual(s2, outerA1.start, accuracy: 1e-9)
+        XCTAssertEqual(e2, outerA1.end, accuracy: 1e-9)
+    }
+}

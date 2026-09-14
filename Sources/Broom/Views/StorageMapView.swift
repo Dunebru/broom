@@ -6,6 +6,10 @@ struct StorageMapView: View {
     @State private var zoom: FileNode? = nil
     @State private var hovered: Arc? = nil
     @State private var arcs: [Arc] = []
+    @State private var previousArcs: [Arc] = []
+    @State private var previousRoot: FileNode? = nil
+    @State private var morph: MorphTransform? = nil
+    @State private var morphProgress: Double = 1
     @State private var showSmall = false
     @State private var confirmTrash = false
     @State private var trashing = false
@@ -25,12 +29,11 @@ struct StorageMapView: View {
                 Divider()
                 HStack(spacing: 0) {
                     VStack(spacing: 0) {
-                        SunburstView(root: cur, arcs: arcs, centerTitle: centerTitle(cur), hovered: $hovered,
+                        SunburstView(root: cur, arcs: arcs, previousArcs: previousArcs, transform: morph, progress: morphProgress,
+                                     centerTitle: centerTitle(cur), hovered: $hovered,
                                      onSelect: { zoomTo($0) },
                                      onUp: { if let p = cur.parent { zoomTo(p) } })
                             .padding(20)
-                            .id(cur.id)
-                            .transition(reduceMotion ? .opacity : .scale(scale: 0.9).combined(with: .opacity))
                         collectorZone
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -40,8 +43,8 @@ struct StorageMapView: View {
                 }
             }
             .onAppear { relayout() }
-            .onChange(of: model.root?.id) { _, _ in zoom = nil; relayout() }
-            .onChange(of: zoom?.id) { _, _ in relayout() }
+            .onChange(of: model.root?.id) { _, _ in zoom = nil; previousArcs = []; previousRoot = nil; relayout() }
+            .onChange(of: zoom?.id) { _, _ in relayout(animated: true) }
             .sheet(isPresented: $showSmall) { smallObjectsSheet(for: cur) }
             .confirmationDialog("Move \(model.collector.count) item\(model.collector.count == 1 ? "" : "s") (\(Format.bytes(model.collector.total))) to the Trash?", isPresented: $confirmTrash, titleVisibility: .visible) {
                 Button("Move to Trash", role: .destructive) { commitCollector() }
@@ -62,13 +65,34 @@ struct StorageMapView: View {
 
     // MARK: layout
 
-    private func relayout() {
+    private func relayout(animated: Bool = false) {
         guard let cur = current else { arcs = []; return }
+        let old = arcs
+        let oldRoot = previousRoot
+        let fresh: [Arc]
         if isWholeDisk, cur.parent == nil, model.volume.total > 0 {
-            arcs = SunburstLayout.arcs(for: cur, usedFraction: Double(cur.size) / Double(model.volume.total), hiddenBytes: hiddenBytes, capacity: model.volume.total)
+            fresh = SunburstLayout.arcs(for: cur, usedFraction: Double(cur.size) / Double(model.volume.total), hiddenBytes: hiddenBytes, capacity: model.volume.total)
         } else {
-            arcs = SunburstLayout.arcs(for: cur)
+            fresh = SunburstLayout.arcs(for: cur)
         }
+        // Morph from the old rings to the new ones: the chosen folder grows into the center ring and
+        // everything else slides in step. Reduce Motion gets a plain swap.
+        if animated, !reduceMotion, let oldRoot, !old.isEmpty {
+            var tx = Transaction(); tx.disablesAnimations = true
+            withTransaction(tx) {
+                previousArcs = old
+                morph = MorphTransform.between(from: old, fromRoot: oldRoot, to: fresh, toRoot: cur)
+                morphProgress = 0
+                arcs = fresh
+            }
+            withAnimation(.spring(response: 0.62, dampingFraction: 1)) { morphProgress = 1 }
+        } else {
+            previousArcs = []
+            morph = nil
+            morphProgress = 1
+            arcs = fresh
+        }
+        previousRoot = cur
     }
 
     private func centerTitle(_ cur: FileNode) -> String {
@@ -78,7 +102,7 @@ struct StorageMapView: View {
     private func zoomTo(_ n: FileNode) {
         guard n.isDirectory else { return }
         hovered = nil
-        withAnimation(reduceMotion ? nil : .spring(response: 0.38, dampingFraction: 1)) { zoom = n === model.root ? nil : n }
+        zoom = n === model.root ? nil : n
     }
 
     // MARK: chrome

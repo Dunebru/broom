@@ -91,9 +91,188 @@ enum SunburstLayout {
     }
 }
 
+/// How one layout maps onto the next when the map zooms. Zooming into a segment stretches that
+/// segment over the full circle and moves its children one ring inward; zooming out is the inverse.
+struct MorphTransform {
+    /// Angular window of the zoomed segment in the outer layout, and its ring depth.
+    var start: Double
+    var end: Double
+    var depth: Int
+    /// Root span of the inner layout (a full circle, or less for a whole-disk root).
+    var innerSpan: Double
+    /// True when the new layout is inside the old one (zoom in), false when zooming out.
+    var zoomIn: Bool
+
+    /// Geometry (depth, start, end) of an outer-layout arc expressed in inner-layout coordinates.
+    func toInner(depth: Double, start: Double, end: Double) -> (Double, Double, Double) {
+        let w = max(self.end - self.start, 1e-9)
+        return (depth - Double(self.depth), (start - self.start) / w * innerSpan, (end - self.start) / w * innerSpan)
+    }
+
+    /// Geometry of an inner-layout arc expressed in outer-layout coordinates.
+    func toOuter(depth: Double, start: Double, end: Double) -> (Double, Double, Double) {
+        let w = self.end - self.start
+        return (depth + Double(self.depth), self.start + start / innerSpan * w, self.start + end / innerSpan * w)
+    }
+
+    /// Where an arc from the previous layout ends up.
+    func target(depth: Double, start: Double, end: Double) -> (Double, Double, Double) {
+        zoomIn ? toInner(depth: depth, start: start, end: end) : toOuter(depth: depth, start: start, end: end)
+    }
+
+    /// Where an arc from the next layout comes from.
+    func source(depth: Double, start: Double, end: Double) -> (Double, Double, Double) {
+        zoomIn ? toOuter(depth: depth, start: start, end: end) : toInner(depth: depth, start: start, end: end)
+    }
+
+    static func rootSpan(of arcs: [Arc]) -> Double {
+        let ends = arcs.filter { $0.depth == 1 && $0.colorIndex != -2 }.map(\.end)
+        return ends.max() ?? 2 * .pi
+    }
+
+    /// Build the transform for going from `from` (showing `fromRoot`) to `to` (showing `toRoot`).
+    static func between(from: [Arc], fromRoot: FileNode, to: [Arc], toRoot: FileNode) -> MorphTransform? {
+        if toRoot.isDescendant(of: fromRoot), let a = from.first(where: { $0.node === toRoot }) {
+            return MorphTransform(start: a.start, end: a.end, depth: a.depth, innerSpan: rootSpan(of: to), zoomIn: true)
+        }
+        if fromRoot.isDescendant(of: toRoot), let a = to.first(where: { $0.node === fromRoot }) {
+            return MorphTransform(start: a.start, end: a.end, depth: a.depth, innerSpan: rootSpan(of: from), zoomIn: false)
+        }
+        return nil
+    }
+}
+
+/// Identity of an arc across layouts: the node for real items, otherwise the parent plus kind.
+private func arcKey(_ a: Arc) -> String {
+    switch a.kind {
+    case .item(let n): return "n\(n.id)"
+    case .small(_, let items): return "s\(items.first?.parent?.id ?? -1)"
+    case .hidden: return "h"
+    }
+}
+
+/// The ring drawing, animatable between two layouts. `progress` runs 0 to 1 while SwiftUI
+/// interpolates it, and every frame draws each arc somewhere between its old and new place.
+struct SunburstCanvas: View, Animatable {
+    var from: [Arc]
+    var to: [Arc]
+    var transform: MorphTransform?
+    var progress: Double
+    var hovered: Arc?
+    var hole: Double
+    var ring: Double
+    var center: CGPoint
+    var scheme: ColorScheme
+
+    var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    private struct Drawn {
+        var depth: Double
+        var start: Double
+        var end: Double
+        var colorIndex: Int
+        var isSmall: Bool
+        var opacity: Double
+        var hover: Bool
+        var kin: Bool
+        var oldColorIndex: Int?
+    }
+
+    var body: some View {
+        Canvas(rendersAsynchronously: true) { ctx, _ in
+            var track = Path()
+            track.addArc(center: center, radius: hole + ring - 1, startAngle: .zero, endAngle: .degrees(360), clockwise: false)
+            track.addArc(center: center, radius: hole + 1, startAngle: .degrees(360), endAngle: .zero, clockwise: true)
+            ctx.fill(track, with: .color(scheme == .dark ? .white.opacity(0.05) : .black.opacity(0.04)))
+
+            for d in drawn() {
+                guard d.opacity > 0.01 else { continue }
+                let startA = max(0, d.start), endA = min(2 * .pi, d.end)
+                guard endA - startA > 0.0005 else { continue }
+                let inner = max(hole + 1, hole + ring * (d.depth - 1) + 1)
+                let outer = min(hole + ring * Double(SunburstLayout.maxDepth) - 1, hole + ring * d.depth - 1)
+                guard outer > inner else { continue }
+                var path = Path()
+                path.addArc(center: center, radius: outer, startAngle: .radians(startA - .pi / 2), endAngle: .radians(endA - .pi / 2), clockwise: false)
+                path.addArc(center: center, radius: inner, startAngle: .radians(endA - .pi / 2), endAngle: .radians(startA - .pi / 2), clockwise: true)
+                path.closeSubpath()
+                let hi = d.hover || d.kin
+                let dim = hovered != nil && !hi
+                let depthInt = max(1, Int(d.depth.rounded()))
+                func paint(_ index: Int) -> Color {
+                    let c = SunburstPalette.color(index: index, depth: depthInt, scheme: scheme, highlighted: hi, dimmed: dim)
+                    return d.isSmall ? c.opacity(dim ? 0.2 : 0.45) : c
+                }
+                if let old = d.oldColorIndex, old != d.colorIndex, progress < 1 {
+                    ctx.fill(path, with: .color(paint(old).opacity(d.opacity * (1 - progress))))
+                    ctx.fill(path, with: .color(paint(d.colorIndex).opacity(d.opacity * progress)))
+                } else {
+                    ctx.fill(path, with: .color(paint(d.colorIndex).opacity(d.opacity)))
+                }
+                if endA - startA > 0.015 {
+                    ctx.stroke(path, with: .color((scheme == .dark ? Color.black.opacity(0.45) : Color.white.opacity(0.9)).opacity(d.opacity)), lineWidth: 0.8)
+                }
+            }
+        }
+    }
+
+    private func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
+
+    private func drawn() -> [Drawn] {
+        let t = min(1, max(0, progress))
+        var hoverNode: FileNode? = hovered?.node
+        if hovered != nil, hoverNode == nil { hoverNode = nil }
+        func kin(_ a: Arc) -> Bool {
+            guard let hn = hoverNode, let n = a.node else { return false }
+            return n === hn || n.isDescendant(of: hn)
+        }
+        if t >= 1 || from.isEmpty {
+            return to.map { Drawn(depth: Double($0.depth), start: $0.start, end: $0.end, colorIndex: $0.colorIndex,
+                                  isSmall: { if case .small = $0.kind { return true }; return false }($0),
+                                  opacity: 1, hover: hovered?.id == $0.id, kin: kin($0), oldColorIndex: nil) }
+        }
+        let fromByKey = Dictionary(from.map { (arcKey($0), $0) }, uniquingKeysWith: { a, _ in a })
+        let toKeys = Set(to.map(arcKey))
+        var out: [Drawn] = []
+        out.reserveCapacity(from.count + to.count)
+        for b in to {
+            let key = arcKey(b)
+            let isSmall: Bool = { if case .small = b.kind { return true }; return false }()
+            if let a = fromByKey[key] {
+                out.append(Drawn(depth: lerp(Double(a.depth), Double(b.depth), t), start: lerp(a.start, b.start, t), end: lerp(a.end, b.end, t),
+                                 colorIndex: b.colorIndex, isSmall: isSmall, opacity: 1, hover: hovered?.id == b.id, kin: kin(b), oldColorIndex: a.colorIndex))
+            } else if let tr = transform {
+                let (d0, s0, e0) = tr.source(depth: Double(b.depth), start: b.start, end: b.end)
+                out.append(Drawn(depth: lerp(d0, Double(b.depth), t), start: lerp(s0, b.start, t), end: lerp(e0, b.end, t),
+                                 colorIndex: b.colorIndex, isSmall: isSmall, opacity: t, hover: hovered?.id == b.id, kin: kin(b), oldColorIndex: nil))
+            } else {
+                out.append(Drawn(depth: Double(b.depth), start: b.start, end: b.end, colorIndex: b.colorIndex, isSmall: isSmall, opacity: t, hover: false, kin: false, oldColorIndex: nil))
+            }
+        }
+        for a in from where !toKeys.contains(arcKey(a)) {
+            let isSmall: Bool = { if case .small = a.kind { return true }; return false }()
+            if let tr = transform {
+                let (d1, s1, e1) = tr.target(depth: Double(a.depth), start: a.start, end: a.end)
+                out.append(Drawn(depth: lerp(Double(a.depth), d1, t), start: lerp(a.start, s1, t), end: lerp(a.end, e1, t),
+                                 colorIndex: a.colorIndex, isSmall: isSmall, opacity: 1 - t, hover: false, kin: false, oldColorIndex: nil))
+            } else {
+                out.append(Drawn(depth: Double(a.depth), start: a.start, end: a.end, colorIndex: a.colorIndex, isSmall: isSmall, opacity: 1 - t, hover: false, kin: false, oldColorIndex: nil))
+            }
+        }
+        // Outgoing arcs first so incoming ones paint over them.
+        return out.sorted { $0.opacity < $1.opacity }
+    }
+}
+
 struct SunburstView: View {
     let root: FileNode
     let arcs: [Arc]
+    var previousArcs: [Arc] = []
+    var transform: MorphTransform? = nil
+    var progress: Double = 1
     let centerTitle: String
     @Binding var hovered: Arc?
     var onSelect: (FileNode) -> Void
@@ -112,36 +291,8 @@ struct SunburstView: View {
             let ring = (radius - hole) / Double(SunburstLayout.maxDepth)
 
             ZStack {
-                Canvas(rendersAsynchronously: true) { ctx, _ in
-                    // faint full circle for the innermost ring so free space reads as an empty gap
-                    var track = Path()
-                    track.addArc(center: center, radius: hole + ring - 1, startAngle: .zero, endAngle: .degrees(360), clockwise: false)
-                    track.addArc(center: center, radius: hole + 1, startAngle: .degrees(360), endAngle: .zero, clockwise: true)
-                    ctx.fill(track, with: .color(scheme == .dark ? .white.opacity(0.05) : .black.opacity(0.04)))
-
-                    for a in arcs {
-                        let inner = hole + ring * Double(a.depth - 1) + 1
-                        let outer = hole + ring * Double(a.depth) - 1
-                        var path = Path()
-                        path.addArc(center: center, radius: outer, startAngle: .radians(a.start - .pi / 2), endAngle: .radians(a.end - .pi / 2), clockwise: false)
-                        path.addArc(center: center, radius: inner, startAngle: .radians(a.end - .pi / 2), endAngle: .radians(a.start - .pi / 2), clockwise: true)
-                        path.closeSubpath()
-                        let isHover = hovered?.id == a.id
-                        let isKin = isKinOfHovered(a)
-                        let hi = isHover || isKin
-                        let dim = hovered != nil && !hi
-                        var color: Color
-                        if case .small = a.kind {
-                            color = SunburstPalette.color(index: a.colorIndex, depth: a.depth, scheme: scheme, highlighted: hi, dimmed: dim).opacity(dim ? 0.2 : 0.45)
-                        } else {
-                            color = SunburstPalette.color(index: a.colorIndex, depth: a.depth, scheme: scheme, highlighted: hi, dimmed: dim)
-                        }
-                        ctx.fill(path, with: .color(color))
-                        if a.span > 0.015 {
-                            ctx.stroke(path, with: .color(scheme == .dark ? .black.opacity(0.45) : .white.opacity(0.9)), lineWidth: 0.8)
-                        }
-                    }
-                }
+                SunburstCanvas(from: previousArcs, to: arcs, transform: transform, progress: progress,
+                               hovered: hovered, hole: hole, ring: ring, center: center, scheme: scheme)
                 .drawingGroup()
 
                 VStack(spacing: 1) {
