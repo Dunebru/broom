@@ -51,15 +51,11 @@ Broom does what CleanMyMac and DaisyDisk charge for, in one native app. It draws
 
 ## Install
 
+Signed with a Developer ID and notarized by Apple, so it opens like any other Mac app.
+
 ### Download
 
 Get **Broom.zip** from the [latest release](https://github.com/Dunebru/broom/releases/latest), unzip, and move **Broom.app** to your Applications folder.
-
-The app is not notarized. The first time you open it: **right-click → Open → Open**. If macOS still refuses:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Broom.app
-```
 
 ### Permissions
 
@@ -134,7 +130,7 @@ swift test                 # unit tests
 scripts/build-app.sh       # produces dist/Broom.app and dist/Broom.zip
 ```
 
-No Xcode project. The app is a Swift package; the script assembles the bundle and ad-hoc signs it.
+No Xcode project. The app is a Swift package; the script assembles the bundle; `scripts/notarize.sh` signs and notarizes a release.
 
 ```
 Sources/Broom/Scanner   getattrlistbulk tree scanner
